@@ -1,7 +1,9 @@
 """Inventory Pro - sistem inventory realtime & interaktif (Streamlit + Google Sheets)."""
+import hmac
 import json
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -12,6 +14,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from auth import buat_hash, cek_hash, validasi_password, validasi_username
 from laporan import buat_excel, buat_html, hitung_laporan, KOL_ABC, KOL_DEAD, KOL_RESTOCK
 
 TZ = ZoneInfo("Asia/Jakarta")
@@ -112,20 +115,22 @@ def tambah_transaksi(sku, tipe, qty, operator, catatan):
            sku, tipe, int(qty), operator, catatan]
     sh = get_spreadsheet()
     if sh:
-        sh.worksheet("Transaksi").append_row(row, value_input_option="USER_ENTERED")
+        sh.worksheet("Transaksi").append_row(row, value_input_option="RAW")
     else:
         pd.DataFrame([row], columns=KOLOM_T).to_csv("data/transaksi.csv", mode="a", header=False, index=False)
     load_data.clear()
+    catat_audit("TRANSAKSI", sku, dict(tipe=tipe, qty=int(qty), catatan=catatan))
 
 
 def tambah_produk(data: dict):
     row = [data[k] for k in KOLOM_P]
     sh = get_spreadsheet()
     if sh:
-        sh.worksheet("Produk").append_row(row, value_input_option="USER_ENTERED")
+        sh.worksheet("Produk").append_row(row, value_input_option="RAW")
     else:
         pd.DataFrame([row], columns=KOLOM_P).to_csv("data/produk.csv", mode="a", header=False, index=False)
     load_data.clear()
+    catat_audit("PRODUK_TAMBAH", data["SKU"], data)
 
 
 
@@ -212,6 +217,7 @@ def simpan_tema():
         ws.update_acell("A1", json.dumps(data))
     else:
         json.dump(data, open("data/tema.json", "w", encoding="utf-8"))
+    catat_audit("TEMA_SIMPAN", "tema warna", data)
 
 
 def terapkan_preset():
@@ -230,20 +236,158 @@ def init_tema():
             st.session_state[f"w_{k}"] = v
 
 
-# ---------- login (opsional) ----------
-def cek_login():
-    pw = secret("app_password")
-    if not pw or st.session_state.get("auth"):
-        return
-    st.title("📦 Inventory Pro")
-    masuk = st.text_input("Password", type="password")
-    if st.button("Masuk", type="primary"):
-        if masuk == pw:
-            st.session_state["auth"] = True
-            st.rerun()
+# ---------- pengguna, login & audit ----------
+KOLOM_U = ["Username", "Nama", "Peran", "Hash", "Aktif"]
+KOLOM_A = ["Waktu", "Username", "Aksi", "Objek", "Detail"]
+MAKS_GAGAL = 5
+
+
+def _ws(nama, kolom):
+    """Ambil worksheet; buat otomatis (dengan header) jika belum ada."""
+    sh = get_spreadsheet()
+    try:
+        return sh.worksheet(nama)
+    except Exception:
+        ws = sh.add_worksheet(nama, rows=200, cols=len(kolom))
+        ws.append_row(kolom, value_input_option="RAW")
+        return ws
+
+
+def _baca(nama, kolom, csv):
+    sh = get_spreadsheet()
+    if sh:
+        df = pd.DataFrame(_ws(nama, kolom).get_all_records(numericise_ignore=["all"]))
+    elif os.path.exists(csv):
+        df = pd.read_csv(csv, dtype=str)
+    else:
+        df = pd.DataFrame()
+    return df.reindex(columns=kolom).fillna("").astype(str)
+
+
+@st.cache_data(ttl=10)
+def muat_pengguna():
+    return _baca("Pengguna", KOLOM_U, "data/pengguna.csv")
+
+
+@st.cache_data(ttl=10)
+def muat_audit():
+    df = _baca("Audit", KOLOM_A, "data/audit.csv")
+    df["Waktu"] = pd.to_datetime(df["Waktu"], errors="coerce")
+    return df
+
+
+def tambah_pengguna(d):
+    row = [d[k] for k in KOLOM_U]
+    if get_spreadsheet():
+        _ws("Pengguna", KOLOM_U).append_row(row, value_input_option="RAW")
+    else:
+        os.makedirs("data", exist_ok=True)
+        pd.DataFrame([row], columns=KOLOM_U).to_csv(
+            "data/pengguna.csv", mode="a", header=not os.path.exists("data/pengguna.csv"), index=False)
+    muat_pengguna.clear()
+
+
+def ubah_pengguna(username, **perubahan):
+    if get_spreadsheet():
+        ws = _ws("Pengguna", KOLOM_U)
+        baris = ws.col_values(1).index(username) + 1
+        for k, v in perubahan.items():
+            ws.update_cell(baris, KOLOM_U.index(k) + 1, v)
+    else:
+        df = muat_pengguna().copy()
+        for k, v in perubahan.items():
+            df.loc[df["Username"] == username, k] = v
+        df.to_csv("data/pengguna.csv", index=False)
+    muat_pengguna.clear()
+
+
+def catat_audit(aksi, objek="", detail=None):
+    """Catat aktivitas. Kegagalan mencatat tidak boleh mengganggu pengguna."""
+    try:
+        u = st.session_state.get("user") or {}
+        row = [datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"), u.get("username", "-"), aksi, str(objek),
+               json.dumps(detail, ensure_ascii=False, default=str) if detail else ""]
+        if get_spreadsheet():
+            _ws("Audit", KOLOM_A).append_row(row, value_input_option="RAW")
         else:
-            st.error("Password salah")
+            os.makedirs("data", exist_ok=True)
+            pd.DataFrame([row], columns=KOLOM_A).to_csv(
+                "data/audit.csv", mode="a", header=not os.path.exists("data/audit.csv"), index=False)
+        muat_audit.clear()
+    except Exception:
+        pass
+
+
+def _masuk(u):
+    st.session_state["user"] = dict(username=u["Username"], nama=u["Nama"] or u["Username"], peran=u["Peran"])
+    catat_audit("LOGIN")
+    st.rerun()
+
+
+def _form_password_baru(kunci):
+    """Field username/nama/password untuk akun baru; mengembalikan (data, error)."""
+    un = st.text_input("Username", key=f"{kunci}_un").strip().lower()
+    nm = st.text_input("Nama lengkap", key=f"{kunci}_nm").strip()
+    p1 = st.text_input("Password", type="password", key=f"{kunci}_p1")
+    p2 = st.text_input("Ulangi password", type="password", key=f"{kunci}_p2")
+    return un, nm, p1, p2
+
+
+def cek_login():
+    if st.session_state.get("user"):
+        return
+    kode = secret("app_password")
+    pengguna = muat_pengguna()
+    st.title("📦 Inventory Pro")
+
+    if pengguna.empty:  # belum ada akun sama sekali
+        if not kode:
+            if get_spreadsheet():
+                st.error("Belum ada pengguna. Isi `app_password` di Secrets sebagai kode setup, lalu reboot app.")
+                st.stop()
+            st.session_state["user"] = dict(username="demo", nama="Demo", peran="admin")  # demo lokal
+            st.rerun()
+        st.subheader("Setup awal: buat akun admin pertama")
+        with st.form("setup"):
+            kd = st.text_input("Kode setup (isi `app_password` di Secrets)", type="password")
+            un, nm, p1, p2 = _form_password_baru("setup")
+            ok = st.form_submit_button("Buat akun admin", type="primary")
+        if ok:
+            err = (None if hmac.compare_digest(kd.encode(), str(kode).encode()) else "Kode setup salah.") \
+                or validasi_username(un) or validasi_password(p1) or (None if p1 == p2 else "Password tidak sama.")
+            if err:
+                time.sleep(1)
+                st.error(err)
+            else:
+                tambah_pengguna(dict(Username=un, Nama=nm or un, Peran="admin", Hash=buat_hash(p1), Aktif="Y"))
+                _masuk(muat_pengguna().iloc[0])
+        st.stop()
+
+    st.subheader("Masuk")
+    if st.session_state.get("gagal", 0) >= MAKS_GAGAL:
+        st.error("Terlalu banyak percobaan gagal. Muat ulang halaman dan coba lagi nanti.")
+        st.stop()
+    with st.form("login"):
+        un = st.text_input("Username").strip().lower()
+        pw = st.text_input("Password", type="password")
+        ok = st.form_submit_button("Masuk", type="primary")
+    if ok:
+        cocok = pengguna[(pengguna["Username"] == un) & (pengguna["Aktif"].str.upper() != "N")]
+        if not cocok.empty and cek_hash(pw, cocok.iloc[0]["Hash"]):
+            st.session_state["gagal"] = 0
+            _masuk(cocok.iloc[0])
+        else:
+            st.session_state["gagal"] = st.session_state.get("gagal", 0) + 1
+            time.sleep(1)
+            catat_audit("LOGIN_GAGAL", un or "-")
+            st.error("Username atau password salah.")
     st.stop()
+
+
+def keluar():
+    catat_audit("LOGOUT")
+    for k in ("user", "gagal"):
+        st.session_state.pop(k, None)
 
 
 # ---------- tab: dashboard ----------
@@ -330,14 +474,14 @@ def tab_stok():
 
 
 # ---------- tab: transaksi ----------
-def tab_transaksi(operator):
+def tab_transaksi(operator, admin=False):
     p, t = load_data()
     p = hitung_stok(p, t)
     st.subheader("Catat Transaksi")
     with st.form("form_trx", clear_on_submit=True):
         c = st.columns([3, 2, 1, 3])
         pilih = c[0].selectbox("Produk", p["SKU"] + " · " + p["Nama"])
-        tipe = c[1].selectbox("Tipe", ["Masuk", "Keluar", "Penyesuaian"])
+        tipe = c[1].selectbox("Tipe", ["Masuk", "Keluar"] + (["Penyesuaian"] if admin else []))
         qty = c[2].number_input("Qty", value=1, step=1,
                                 help="Penyesuaian boleh negatif (koreksi stock opname).")
         cat = c[3].text_input("Catatan")
@@ -483,12 +627,107 @@ def tab_laporan():
                          f"laporan_inventory_{hari:%Y%m%d}.html", "text/html")
 
 
+# ---------- tab: pengguna (admin) ----------
+def tab_pengguna():
+    me = st.session_state["user"]["username"]
+    pengguna = muat_pengguna()
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.subheader("Tambah pengguna")
+        with st.form("tambah_user", clear_on_submit=True):
+            un, nm, p1, p2 = _form_password_baru("baru")
+            peran = st.selectbox("Peran", ["staf", "admin"])
+            ok = st.form_submit_button("Tambah", type="primary")
+        if ok:
+            err = validasi_username(un) or validasi_password(p1) or (None if p1 == p2 else "Password tidak sama.")
+            if not err and un in set(pengguna["Username"]):
+                err = "Username sudah dipakai."
+            if err:
+                st.error(err)
+            else:
+                tambah_pengguna(dict(Username=un, Nama=nm or un, Peran=peran, Hash=buat_hash(p1), Aktif="Y"))
+                catat_audit("PENGGUNA_TAMBAH", un, dict(peran=peran))
+                st.success(f"Pengguna {un} ditambahkan.")
+
+    with c2:
+        st.subheader("Ubah pengguna")
+        if not pengguna.empty:
+            pilih = st.selectbox("Pengguna", pengguna["Username"], key="ubah_pilih")
+            row = pengguna[pengguna["Username"] == pilih].iloc[0]
+            aktif_lama = row["Aktif"].upper() != "N"
+            with st.form("ubah_user"):
+                peran_baru = st.selectbox("Peran", ["staf", "admin"], index=1 if row["Peran"] == "admin" else 0, key=f"peran_{pilih}")
+                aktif_baru = st.checkbox("Akun aktif", value=aktif_lama, key=f"aktif_{pilih}")
+                pw_baru = st.text_input("Password baru (kosongkan jika tidak diganti)", type="password", key=f"pw_{pilih}")
+                ok2 = st.form_submit_button("Simpan perubahan")
+            if ok2:
+                err, ubah, log = None, {}, {}
+                if pilih == me and (peran_baru != "admin" or not aktif_baru):
+                    err = "Anda tidak bisa menurunkan atau menonaktifkan akun sendiri."
+                admin_aktif = pengguna[(pengguna["Peran"] == "admin") & (pengguna["Aktif"].str.upper() != "N") & (pengguna["Username"] != pilih)]
+                if not err and len(admin_aktif) == 0 and not (peran_baru == "admin" and aktif_baru):
+                    err = "Harus tersisa minimal satu admin aktif."
+                if not err and pw_baru:
+                    err = validasi_password(pw_baru)
+                if err:
+                    st.error(err)
+                else:
+                    if peran_baru != row["Peran"]:
+                        ubah["Peran"], log["peran"] = peran_baru, [row["Peran"], peran_baru]
+                    if aktif_baru != aktif_lama:
+                        ubah["Aktif"], log["aktif"] = ("Y" if aktif_baru else "N"), [aktif_lama, aktif_baru]
+                    if pw_baru:
+                        ubah["Hash"], log["password_direset"] = buat_hash(pw_baru), True
+                    if not ubah:
+                        st.info("Tidak ada perubahan.")
+                    else:
+                        ubah_pengguna(pilih, **ubah)
+                        catat_audit("PENGGUNA_UBAH", pilih, log)
+                        st.success("Perubahan disimpan.")
+
+    st.subheader("Daftar pengguna")
+    st.dataframe(muat_pengguna()[["Username", "Nama", "Peran", "Aktif"]], hide_index=True, use_container_width=True)
+
+
+# ---------- tab: log audit (admin) ----------
+def tab_audit():
+    a = muat_audit()
+    st.subheader("Log Audit")
+    if a.empty:
+        st.info("Belum ada catatan aktivitas.")
+        return
+    f = st.columns(3)
+    u = f[0].multiselect("Pengguna", sorted(a["Username"].unique()))
+    k = f[1].multiselect("Aksi", sorted(a["Aksi"].unique()))
+    q = f[2].text_input("Cari di objek / detail")
+    if u:
+        a = a[a["Username"].isin(u)]
+    if k:
+        a = a[a["Aksi"].isin(k)]
+    if q:
+        a = a[a["Objek"].str.contains(q, case=False) | a["Detail"].str.contains(q, case=False)]
+    a = a.sort_values("Waktu", ascending=False)
+    st.caption(f"{len(a)} catatan (menampilkan 500 terbaru)")
+    st.dataframe(a.head(500), hide_index=True, use_container_width=True)
+    st.download_button("⬇️ Unduh CSV", a.to_csv(index=False).encode(), "log_audit.csv", "text/csv")
+
+
 # ---------- main ----------
+if not get_spreadsheet() and not os.path.exists("data/produk.csv"):
+    diagnosa_secrets()
+
 cek_login()
 init_tema()
+user = st.session_state["user"]
+admin = user["peran"] == "admin"
+operator = user["nama"]
 with st.sidebar:
     st.title("📦 Inventory Pro")
-    operator = st.text_input("Nama operator", value="Admin")
+    st.markdown(f"👤 **{user['nama']}** · {'Admin' if admin else 'Staf'}")
+    if st.button("🚪 Keluar"):
+        keluar()
+        st.rerun()
     if get_spreadsheet():
         st.success("Terhubung ke Google Sheet")
     else:
@@ -503,25 +742,24 @@ with st.sidebar:
         b1, b2 = st.columns(2)
         if b2.button("↩️ Reset", on_click=reset_tema):
             pass
-        if b1.button("💾 Simpan"):
+        if admin and b1.button("💾 Simpan"):
             try:
                 simpan_tema()
                 st.success("Tersimpan sebagai default.")
             except Exception as e:
                 st.error(f"Gagal menyimpan: {type(e).__name__}")
 
-if not get_spreadsheet() and not os.path.exists("data/produk.csv"):
-    diagnosa_secrets()
-
 st.title("Sistem Inventory")
-t1, t2, t3, t4, t5 = st.tabs(["📊 Dashboard", "📈 Laporan & KPI", "📋 Stok", "🔁 Transaksi", "➕ Produk Baru"])
-with t1:
-    tab_dashboard()
-with t2:
-    tab_laporan()
-with t3:
-    tab_stok()
-with t4:
-    tab_transaksi(operator)
-with t5:
-    tab_produk()
+daftar = [  # (judul, fungsi, khusus admin)
+    ("📊 Dashboard", tab_dashboard, False),
+    ("📈 Laporan & KPI", tab_laporan, True),
+    ("📋 Stok", tab_stok, False),
+    ("🔁 Transaksi", lambda: tab_transaksi(operator, admin), False),
+    ("➕ Produk Baru", tab_produk, True),
+    ("👥 Pengguna", tab_pengguna, True),
+    ("🧾 Log Audit", tab_audit, True),
+]
+daftar = [d for d in daftar if admin or not d[2]]
+for wadah, d in zip(st.tabs([d[0] for d in daftar]), daftar):
+    with wadah:
+        d[1]()
