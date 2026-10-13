@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from auth import buat_hash, cek_hash, validasi_password, validasi_username
-from laporan import buat_excel, buat_html, hitung_laporan, KOL_ABC, KOL_DEAD, KOL_RESTOCK
+from laporan import buat_excel, buat_html, hitung_laporan, hitung_stok, stok_negatif, KOL_ABC, KOL_DEAD, KOL_RESTOCK
 
 TZ = ZoneInfo("Asia/Jakarta")
 KOLOM_P = ["SKU", "Nama", "Kategori", "Supplier", "Lokasi",
@@ -51,7 +51,6 @@ def rp(x):
 
 
 def rp_ringkas(x):
-    """Rp 395,9 jt / Rp 1,2 M, supaya muat di kartu KPI."""
     a = abs(x)
     for batas, satuan in ((1e12, " T"), (1e9, " M"), (1e6, " jt")):
         if a >= batas:
@@ -86,69 +85,42 @@ def load_data():
         t = pd.DataFrame(sh.worksheet("Transaksi").get_all_records())
     else:
         p, t = pd.read_csv("data/produk.csv"), pd.read_csv("data/transaksi.csv")
+    
+    if "Harga" in t.columns and "Harga_Satuan" not in t.columns:
+        t.rename(columns={"Harga": "Harga_Satuan"}, inplace=True)
+        
     p, t = p.reindex(columns=KOLOM_P), t.reindex(columns=KOLOM_T)
     for c in ["Harga_Beli", "Harga_Jual", "Stok_Min", "Stok_Awal"]:
         p[c] = pd.to_numeric(p[c], errors="coerce").fillna(0)
-    for c in ["Qty", "Harga_Satuan"]:
-        if c in t.columns:
-            t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0)
+    t["Qty"] = pd.to_numeric(t["Qty"], errors="coerce").fillna(0)
+    # Harga_Satuan kosong = data lama / bukan transaksi masuk, BUKAN 0 (bonus)
+    t["Harga_Satuan"] = pd.to_numeric(t["Harga_Satuan"], errors="coerce")
     t["Waktu"] = pd.to_datetime(t["Waktu"], errors="coerce")
     return p, t
 
 
-def hitung_stok(p, t):
-    delta = np.where(t["Tipe"] == "Keluar", -t["Qty"], t["Qty"])
-    net = pd.Series(delta, index=t.index).groupby(t["SKU"]).sum()
-    p = p.copy()
-    p["Stok"] = (p["Stok_Awal"] + p["SKU"].map(net).fillna(0)).astype(int)
-    p["Nilai_Stok"] = p["Stok"] * p["Harga_Beli"]
-    p["Status"] = np.select(
-        [p["Stok"] <= 0, p["Stok"] <= p["Stok_Min"], p["Stok"] <= p["Stok_Min"] * 1.5],
-        ["Habis", "Kritis", "Menipis"], "Aman")
-    p["Level"] = (p["Stok"] / (p["Stok_Min"].replace(0, 1) * 3)).clip(0, 1) * 100
-    return p
-
-
-def update_harga_beli_produk(sku, harga_baru):
-    sh = get_spreadsheet()
-    if sh:
-        ws = sh.worksheet("Produk")
-        cell = ws.find(sku)
-        if cell:
-            ws.update_cell(cell.row, 6, round(harga_baru, 2))  # Kolom 6 diasumsikan Harga_Beli
-    else:
-        p = pd.read_csv("data/produk.csv")
-        p.loc[p["SKU"] == sku, "Harga_Beli"] = round(harga_baru, 2)
-        p.to_csv("data/produk.csv", index=False)
-
-
 def tambah_transaksi(sku, tipe, qty, harga_satuan, operator, catatan):
-    p, t = load_data()
-    p_row = p[p["SKU"] == sku]
+    row = [
+        uuid.uuid4().hex[:8].upper(),
+        datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        sku,
+        tipe,
+        int(qty),
+        float(harga_satuan),
+        str(operator),
+        str(catatan)
+    ]
     
-    # Jika transaksi Masuk dan ada harga beli baru, hitung Weighted Average untuk update master produk
-    if tipe == "Masuk" and harga_satuan > 0 and not p_row.empty:
-        delta = np.where(t["Tipe"] == "Keluar", -t["Qty"], t["Qty"])
-        net = pd.Series(delta, index=t.index).groupby(t["SKU"]).sum()
-        stok_saat_ini = int(p_row["Stok_Awal"].values[0] + net.get(sku, 0))
-        harga_lama = float(p_row["Harga_Beli"].values[0])
-        
-        if stok_saat_ini + qty > 0:
-            harga_baru_avg = ((stok_saat_ini * harga_lama) + (qty * harga_satuan)) / (stok_saat_ini + qty)
-        else:
-            harga_baru_avg = harga_satuan
-            
-        update_harga_beli_produk(sku, harga_baru_avg)
-
-    row = [uuid.uuid4().hex[:8].upper(), datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-           sku, tipe, int(qty), float(harga_satuan), operator, catatan]
     sh = get_spreadsheet()
     if sh:
         sh.worksheet("Transaksi").append_row(row, value_input_option="RAW")
     else:
-        pd.DataFrame([row], columns=KOLOM_T).to_csv("data/transaksi.csv", mode="a", header=False, index=False)
+        file_path = "data/transaksi.csv"
+        ada_file = os.path.exists(file_path)
+        pd.DataFrame([row], columns=KOLOM_T).to_csv(file_path, mode="a", header=not ada_file, index=False)
+        
     load_data.clear()
-    catat_audit("TRANSAKSI", sku, dict(tipe=tipe, qty=int(qty), harga_satuan=harga_satuan, catatan=catatan))
+    catat_audit("TRANSAKSI", sku, dict(tipe=tipe, qty=int(qty), harga_satuan=harga_satuan, operator=operator, catatan=catatan))
 
 
 def tambah_produk(data: dict):
@@ -493,11 +465,11 @@ def tab_stok():
     if cari:
         d = d[d["Nama"].str.contains(cari, case=False) | d["SKU"].str.contains(cari, case=False)]
     st.dataframe(
-        warnai_status(d[["SKU", "Nama", "Kategori", "Lokasi", "Stok", "Stok_Min", "Level", "Status", "Harga_Beli", "Harga_Jual", "Nilai_Stok"]]),
+        warnai_status(d[["SKU", "Nama", "Kategori", "Lokasi", "Stok", "Stok_Min", "Level", "Status", "Harga_Rata2", "Harga_Jual", "Nilai_Stok"]]),
         hide_index=True, use_container_width=True,
         column_config={
             "Level": st.column_config.ProgressColumn("Level Stok", min_value=0, max_value=100, format="%d%%"),
-            "Harga_Beli": st.column_config.NumberColumn("Harga Beli", format="Rp %d"),
+            "Harga_Rata2": st.column_config.NumberColumn("HPP rata-rata", format="Rp %d"),
             "Harga_Jual": st.column_config.NumberColumn("Harga Jual", format="Rp %d"),
             "Nilai_Stok": st.column_config.NumberColumn("Nilai Stok", format="Rp %d"),
             "Stok_Min": "Min",
@@ -505,26 +477,155 @@ def tab_stok():
     st.download_button("⬇️ Unduh CSV", d.to_csv(index=False).encode(), "stok.csv", "text/csv")
 
 
+# ---------- edit / hapus transaksi (khusus admin) ----------
+def _kolom_sheet(header, nama):
+    if nama in header:
+        return header.index(nama) + 1
+    if nama == "Harga_Satuan" and "Harga" in header:
+        return header.index("Harga") + 1
+    raise ValueError(f"Kolom '{nama}' tidak ada di sheet Transaksi")
+
+
+def _ubah_baris_transaksi(id_, perubahan):
+    sh = get_spreadsheet()
+    if sh:
+        from gspread.utils import rowcol_to_a1
+        ws = sh.worksheet("Transaksi")
+        header = ws.row_values(1)
+        baris = ws.col_values(1).index(id_) + 1
+        for k, v in perubahan.items():
+            ws.update(range_name=rowcol_to_a1(baris, _kolom_sheet(header, k)), values=[[v]], raw=True)
+    else:
+        df = pd.read_csv("data/transaksi.csv", dtype=str)
+        m = df["ID"].str.upper() == id_
+        for k, v in perubahan.items():
+            df.loc[m, k if k in df.columns else "Harga"] = str(v)
+        df.to_csv("data/transaksi.csv", index=False)
+    load_data.clear()
+
+
+def _hapus_baris_transaksi(id_):
+    sh = get_spreadsheet()
+    if sh:
+        ws = sh.worksheet("Transaksi")
+        ws.delete_rows(ws.col_values(1).index(id_) + 1)
+    else:
+        df = pd.read_csv("data/transaksi.csv", dtype=str)
+        df[df["ID"].str.upper() != id_].to_csv("data/transaksi.csv", index=False)
+    load_data.clear()
+
+
+def _stok_aman_setelah(p, t, id_, qty_baru=None):
+    """None jika aman; pesan error jika perubahan membuat stok negatif di riwayat."""
+    t2 = t.copy()
+    m = t2["ID"].astype(str).str.upper() == id_
+    if qty_baru is None:
+        t2 = t2[~m]
+    else:
+        t2.loc[m, "Qty"] = qty_baru
+    baru = set(stok_negatif(p, t2)) - set(stok_negatif(p, t))
+    if baru:
+        return ("Ditolak: perubahan ini membuat stok negatif pada produk " + ", ".join(sorted(baru))
+                + ". Koreksi transaksi keluar terkait terlebih dahulu.")
+    return None
+
+
+def kelola_transaksi(p, t, r, admin):
+    pesan = st.session_state.pop("pesan_kelola", None)
+    if pesan:
+        st.toast(pesan)
+    with st.expander("⚙️ Kelola / Edit / Hapus Transaksi"):
+        if not admin:
+            st.info("Hanya admin yang dapat mengedit atau menghapus transaksi.")
+            return
+        if r.empty:
+            st.info("Tidak ada riwayat transaksi untuk dikelola.")
+            return
+        daftar = r.head(200)
+        st.caption("Menampilkan 200 transaksi terbaru.")
+        label = daftar.apply(lambda x: f"[{x['ID']}] {x['Waktu']} - {x['Nama']} ({x['Tipe']} Qty: {x['Qty']})", axis=1)
+        pilih = st.selectbox("Pilih transaksi yang ingin dikelola:", label)
+        id_ = pilih.split("]")[0].lstrip("[").strip().upper()
+        trx = daftar[daftar["ID"].astype(str).str.upper() == id_].iloc[0]
+        tipe = trx["Tipe"]
+        harga_ada = pd.notna(trx["Harga_Satuan"])
+        st.write(f"**Terpilih:** `{id_}` · `{trx['SKU']}` · {tipe}")
+        tab_e, tab_h = st.tabs(["✏️ Edit", "🗑️ Hapus"])
+
+        with tab_e:
+            with st.form(f"form_edit_{id_}"):
+                qty_baru = st.number_input("Qty baru", value=int(trx["Qty"]), step=1)
+                harga_baru = 0.0
+                if tipe == "Masuk":
+                    harga_baru = st.number_input(
+                        "Harga beli satuan (Rp)", min_value=0.0, step=1000.0,
+                        value=float(trx["Harga_Satuan"]) if harga_ada else 0.0,
+                        help="0 = barang bonus. Pada data lama yang harganya kosong, biarkan 0 agar tetap kosong.")
+                catatan_baru = st.text_input("Catatan", value="" if pd.isna(trx["Catatan"]) else str(trx["Catatan"]))
+                simpan = st.form_submit_button("Simpan perubahan", type="primary")
+            if simpan:
+                if tipe != "Penyesuaian" and qty_baru <= 0:
+                    err = "Qty harus lebih dari 0."
+                elif tipe == "Penyesuaian" and qty_baru == 0:
+                    err = "Qty penyesuaian tidak boleh 0."
+                else:
+                    err = _stok_aman_setelah(p, t, id_, int(qty_baru))
+                if err:
+                    st.error(err)
+                else:
+                    ubah = {"Qty": int(qty_baru), "Catatan": catatan_baru}
+                    if tipe == "Masuk" and (harga_ada or harga_baru > 0):
+                        ubah["Harga_Satuan"] = float(harga_baru)
+                    _ubah_baris_transaksi(id_, ubah)
+                    catat_audit("TRANSAKSI_EDIT", id_, dict(
+                        sku=trx["SKU"], sesudah=ubah,
+                        sebelum=dict(qty=int(trx["Qty"]), harga=float(trx["Harga_Satuan"]) if harga_ada else None,
+                                     catatan="" if pd.isna(trx["Catatan"]) else str(trx["Catatan"]))))
+                    st.session_state["pesan_kelola"] = f"Transaksi {id_} diperbarui."
+                    st.rerun()
+
+        with tab_h:
+            st.warning("Menghapus transaksi mengembalikan stok dan biaya rata-rata seolah transaksi itu tidak pernah ada.")
+            if st.button("🗑️ Hapus transaksi ini", type="primary", key=f"hapus_trx_{id_}"):
+                err = _stok_aman_setelah(p, t, id_)
+                if err:
+                    st.error(err)
+                else:
+                    _hapus_baris_transaksi(id_)
+                    catat_audit("TRANSAKSI_HAPUS", id_, dict(
+                        sku=trx["SKU"], tipe=tipe, qty=int(trx["Qty"]),
+                        harga=float(trx["Harga_Satuan"]) if harga_ada else None))
+                    st.session_state["pesan_kelola"] = f"Transaksi {id_} dihapus."
+                    st.rerun()
+
+
 # ---------- tab: transaksi ----------
 def tab_transaksi(operator, admin=False):
     p, t = load_data()
     p = hitung_stok(p, t)
     st.subheader("Catat Transaksi")
+    
     with st.form("form_trx", clear_on_submit=True):
-        c = st.columns([3, 2, 1, 2, 3])
+        c = st.columns([3, 2, 1])
         pilih = c[0].selectbox("Produk", p["SKU"] + " · " + p["Nama"])
         tipe = c[1].selectbox("Tipe", ["Masuk", "Keluar"] + (["Penyesuaian"] if admin else []))
-        qty = c[2].number_input("Qty", value=1, step=1,
-                                help="Penyesuaian boleh negatif (koreksi stock opname).")
-        harga_masuk_baru = c[3].number_input("Harga Beli (Rp)", min_value=0.0, step=1000.0,
+        qty = c[2].number_input("Qty", value=1, step=1, help="Penyesuaian boleh negatif.")
+
+        c2 = st.columns([2, 2, 3])
+        is_bonus = c2[0].checkbox("🎁 Barang Bonus (Harga Beli Rp 0)", value=False)
+        harga_masuk_baru = c2[1].number_input("Harga Beli Satuan (Rp)", min_value=0.0, value=0.0, step=1000.0,
+                                             disabled=is_bonus,
                                              help="Isi harga beli satuan baru khusus jika barang Masuk.")
-        cat = c[4].text_input("Catatan")
-        kirim = st.form_submit_button("Simpan", type="primary")
+        cat = c2[2].text_input("Catatan")
+        
+        st.caption(f"✍️ Operator pencatat: **{operator}**")
+        kirim = st.form_submit_button("Simpan Transaksi", type="primary")
         
     if kirim:
         sku = pilih.split(" · ")[0]
         stok_now = int(p.loc[p["SKU"] == sku, "Stok"].iloc[0])
-        
+        final_harga = 0.0 if is_bonus else float(harga_masuk_baru)
+
         if tipe != "Penyesuaian" and qty <= 0:
             st.error("Qty harus lebih dari 0.")
         elif tipe == "Penyesuaian" and qty == 0:
@@ -533,10 +634,12 @@ def tab_transaksi(operator, admin=False):
             st.error(f"Stok tidak cukup. Stok saat ini: {stok_now}.")
         elif tipe == "Penyesuaian" and stok_now + qty < 0:
             st.error("Penyesuaian membuat stok negatif.")
+        elif tipe == "Masuk" and not is_bonus and final_harga <= 0:
+            st.error("Harga beli tidak boleh 0 untuk barang masuk berbayar. Jika gratis, centang 'Barang Bonus'.")
         else:
-            h_satuan = harga_masuk_baru if tipe == "Masuk" else 0.0
+            h_satuan = final_harga if tipe == "Masuk" else 0.0
             tambah_transaksi(sku, tipe, qty, h_satuan, operator, cat)
-            st.success("Transaksi berhasil disimpan.")
+            st.success(f"Transaksi berhasil disimpan oleh {operator}.")
             st.rerun()
 
     st.subheader("Riwayat Terbaru")
@@ -544,9 +647,13 @@ def tab_transaksi(operator, admin=False):
     ft = st.multiselect("Filter tipe", ["Masuk", "Keluar", "Penyesuaian"], key="ft")
     if ft:
         r = r[r["Tipe"].isin(ft)]
+    
+    # Format mata uang menggunakan titik pemisah ribuan (Rp 150.000)
     st.dataframe(r[["Waktu", "ID", "SKU", "Nama", "Tipe", "Qty", "Harga_Satuan", "Operator", "Catatan"]].head(100),
                  hide_index=True, use_container_width=True,
                  column_config={"Harga_Satuan": st.column_config.NumberColumn("Harga Masuk", format="Rp %d")})
+
+    kelola_transaksi(p, t, r, admin)
 
 
 # ---------- tab: produk baru ----------
