@@ -1,6 +1,6 @@
 # Inventory Pro (Python + Streamlit + Google Sheets)
 
-Fitur: dashboard realtime (auto-refresh 15 detik), filter interaktif, catat transaksi masuk/keluar/penyesuaian
+Fitur: dashboard realtime, tab Laporan & KPI (turnover, DOI, sell-through, margin, ABC, restock, dead stock; unduh Excel/HTML) (auto-refresh 15 detik), filter interaktif, catat transaksi masuk/keluar/penyesuaian
 dengan validasi stok, tambah produk, peringatan restock, login password opsional.
 
 ## 1. Coba lokal (mode demo, tanpa Google Sheet)
@@ -27,3 +27,11 @@ dengan validasi stok, tambah produk, peringatan restock, login password opsional
 Produk: SKU, Nama, Kategori, Supplier, Lokasi, Harga_Beli, Harga_Jual, Stok_Min, Stok_Awal
 Transaksi: ID, Waktu, SKU, Tipe (Masuk/Keluar/Penyesuaian), Qty, Operator, Catatan
 Stok saat ini = Stok_Awal + total Masuk - total Keluar + Penyesuaian (dihitung otomatis).
+
+## Login, peran, dan log audit
+- **Setup pertama**: saat aplikasi dibuka dan belum ada pengguna, muncul layar "Setup awal". Isi **kode setup** (= nilai `app_password` di Secrets), lalu buat akun admin pertama.
+- **Pengguna** disimpan di tab `Pengguna` pada Google Sheet (password di-hash PBKDF2, tidak pernah disimpan polos).
+- **Peran**: `admin` = semua menu (Laporan & KPI, Produk Baru, Pengguna, Log Audit, simpan tema, transaksi Penyesuaian).
+  `staf` = Dashboard, Stok, dan Transaksi Masuk/Keluar. Nama operator pada transaksi terisi otomatis dari akun yang login.
+- **Log audit** tersimpan di tab `Audit`: login/logout, transaksi, produk baru, perubahan pengguna, simpan tema (siapa, kapan, apa).
+- Jangan edit tab `Pengguna` dan `Audit` manual di Google Sheet, kecuali Anda paham risikonya.
