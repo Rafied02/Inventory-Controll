@@ -6,7 +6,10 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+
+from laporan import buat_excel, buat_html, hitung_laporan, KOL_ABC, KOL_DEAD, KOL_RESTOCK
 
 TZ = ZoneInfo("Asia/Jakarta")
 KOLOM_P = ["SKU", "Nama", "Kategori", "Supplier", "Lokasi",
@@ -59,7 +62,7 @@ def load_data():
         p = pd.DataFrame(sh.worksheet("Produk").get_all_records())
         t = pd.DataFrame(sh.worksheet("Transaksi").get_all_records())
     else:
-        p, t = pd.read_csv("produk.csv"), pd.read_csv("transaksi.csv")
+        p, t = pd.read_csv("data/produk.csv"), pd.read_csv("data/transaksi.csv")
     p, t = p.reindex(columns=KOLOM_P), t.reindex(columns=KOLOM_T)
     for c in ["Harga_Beli", "Harga_Jual", "Stok_Min", "Stok_Awal"]:
         p[c] = pd.to_numeric(p[c], errors="coerce").fillna(0)
@@ -88,7 +91,7 @@ def tambah_transaksi(sku, tipe, qty, operator, catatan):
     if sh:
         sh.worksheet("Transaksi").append_row(row, value_input_option="USER_ENTERED")
     else:
-        pd.DataFrame([row], columns=KOLOM_T).to_csv("transaksi.csv", mode="a", header=False, index=False)
+        pd.DataFrame([row], columns=KOLOM_T).to_csv("data/transaksi.csv", mode="a", header=False, index=False)
     load_data.clear()
 
 
@@ -98,7 +101,7 @@ def tambah_produk(data: dict):
     if sh:
         sh.worksheet("Produk").append_row(row, value_input_option="USER_ENTERED")
     else:
-        pd.DataFrame([row], columns=KOLOM_P).to_csv("produk.csv", mode="a", header=False, index=False)
+        pd.DataFrame([row], columns=KOLOM_P).to_csv("data/produk.csv", mode="a", header=False, index=False)
     load_data.clear()
 
 
@@ -270,6 +273,92 @@ def tab_produk():
             st.rerun()
 
 
+
+# ---------- tab: laporan & KPI ----------
+def tab_laporan():
+    p, t = load_data()
+    p = hitung_stok(p, t)
+    hari = datetime.now(TZ).date()
+    c = st.columns([2, 1, 1])
+    rentang = c[0].date_input("Periode laporan", value=(hari - timedelta(days=29), hari), key="rentang")
+    lead = c[1].number_input("Lead time supplier (hari)", 1, 60, 7)
+    cover = c[2].number_input("Target cakupan stok (hari)", 1, 90, 14)
+    if not (isinstance(rentang, (tuple, list)) and len(rentang) == 2):
+        st.info("Pilih tanggal mulai dan tanggal selesai.")
+        return
+    mulai = pd.Timestamp(rentang[0])
+    akhir = pd.Timestamp(rentang[1]) + pd.Timedelta(days=1)
+    h = hitung_laporan(p, t, mulai, akhir, lead, cover)
+    k = h["kpi"]
+
+    def delta(a, b):
+        return f"{(a - b) / b * 100:+.1f}% vs periode lalu" if b else None
+
+    st.subheader("KPI Utama")
+    m = st.columns(4)
+    m[0].metric("Pendapatan", rp(k["pendapatan"]), delta(k["pendapatan"], k["pendapatan_prev"]))
+    m[1].metric("HPP", rp(k["hpp"]), delta(k["hpp"], k["hpp_prev"]), delta_color="off")
+    m[2].metric("Laba Kotor", rp(k["laba"]), delta(k["laba"], k["laba_prev"]))
+    m[3].metric("Margin Kotor", f"{k['margin']:.1f}%", f"{k['margin'] - k['margin_prev']:+.1f} poin")
+    m = st.columns(4)
+    m[0].metric("Inventory Turnover", f"{k['turnover']:.2f}x", f"setahun ≈ {k['turnover_tahunan']:.1f}x", delta_color="off")
+    m[1].metric("Days of Inventory", "-" if pd.isna(k["doi"]) else f"{k['doi']:.0f} hari")
+    m[2].metric("Sell-Through", f"{k['sell_through']:.1f}%")
+    m[3].metric("Nilai Persediaan", rp(k["nilai_stok"]))
+    m = st.columns(4)
+    m[0].metric("Stockout Rate", f"{k['stockout']:.1f}%")
+    m[1].metric("Dead Stock", rp(k["dead_nilai"]), f"{k['dead_sku']} SKU", delta_color="off")
+    m[2].metric("Unit Masuk / Keluar", f"{k['unit_masuk']:,.0f} / {k['unit_keluar']:,.0f}".replace(",", "."))
+    m[3].metric("Perlu Restock", f"{k['restock_sku']} SKU", f"≈ {rp(k['restock_biaya'])}", delta_color="off")
+
+    st.subheader("Scorecard KPI vs Target")
+    st.dataframe(h["skor"], hide_index=True, use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    fig = px.line(h["harian"], x="Tanggal", y=["Pendapatan", "Laba"], markers=True, title="Tren Pendapatan & Laba Harian",
+                  color_discrete_sequence=["#2563eb", "#16a34a"])
+    fig.update_layout(height=340, margin=dict(t=50, b=10, l=10, r=10), legend_title=None, yaxis_title="Rp")
+    c1.plotly_chart(fig, use_container_width=True)
+    fig = px.bar(h["kategori"].sort_values("Laba"), x="Laba", y="Kategori", orientation="h", color="Margin_%",
+                 color_continuous_scale="Blues", title="Laba & Margin per Kategori")
+    fig.update_layout(height=340, margin=dict(t=50, b=10, l=10, r=10), coloraxis_colorbar_title="Margin %")
+    c2.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Analisis ABC (Pareto Pendapatan)")
+    abc = h["abc"]
+    if abc.empty:
+        st.info("Belum ada penjualan pada periode ini.")
+    else:
+        warna = {"A": "#2563eb", "B": "#f59e0b", "C": "#94a3b8"}
+        fig = go.Figure()
+        fig.add_bar(x=abc["SKU"], y=abc["Pendapatan"], marker_color=abc["Kelas"].map(warna), name="Pendapatan",
+                    customdata=abc[["Nama", "Kelas"]], hovertemplate="%{customdata[0]}<br>Kelas %{customdata[1]}<br>Rp %{y:,.0f}<extra></extra>")
+        fig.add_scatter(x=abc["SKU"], y=abc["Kum_%"], yaxis="y2", mode="lines+markers", name="Kumulatif %", line=dict(color="#ef4444"))
+        fig.update_layout(height=360, margin=dict(t=30, b=10, l=10, r=10), yaxis2=dict(overlaying="y", side="right", range=[0, 105], title="%"),
+                          yaxis_title="Rp", legend=dict(orientation="h", y=1.12))
+        st.plotly_chart(fig, use_container_width=True)
+        ringkas = abc.groupby("Kelas").agg(Jumlah_SKU=("SKU", "count"), Pendapatan=("Pendapatan", "sum")).reset_index()
+        st.caption("A = ±80% pendapatan (prioritas jaga stok) · B = 15% berikutnya · C = sisanya")
+        st.dataframe(ringkas, hide_index=True, use_container_width=True,
+                     column_config={"Pendapatan": st.column_config.NumberColumn(format="Rp %d")})
+
+    with st.expander(f"🛒 Saran Restock ({len(h['restock'])} SKU)", expanded=not h["restock"].empty):
+        st.dataframe(h["restock"][KOL_RESTOCK], hide_index=True, use_container_width=True,
+                     column_config={"Est_Biaya": st.column_config.NumberColumn("Est. Biaya", format="Rp %d"),
+                                    "Rata2_Harian": st.column_config.NumberColumn("Rata2/hari", format="%.1f"),
+                                    "Cakupan_Hari": st.column_config.NumberColumn("Cakupan (hari)", format="%.1f")})
+    with st.expander(f"🧊 Dead Stock ({len(h['dead'])} SKU)"):
+        st.dataframe(h["dead"][KOL_DEAD], hide_index=True, use_container_width=True,
+                     column_config={"Nilai_Stok": st.column_config.NumberColumn("Nilai Stok", format="Rp %d")})
+
+    st.subheader("Unduh Laporan")
+    d = st.columns(2)
+    d[0].download_button("⬇️ Excel (6 sheet)", buat_excel(h), f"laporan_inventory_{hari:%Y%m%d}.xlsx",
+                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    d[1].download_button("⬇️ HTML (siap cetak / simpan PDF)", buat_html(h).encode("utf-8"),
+                         f"laporan_inventory_{hari:%Y%m%d}.html", "text/html")
+
+
 # ---------- main ----------
 cek_login()
 with st.sidebar:
@@ -284,12 +373,14 @@ with st.sidebar:
         st.rerun()
 
 st.title("Sistem Inventory")
-t1, t2, t3, t4 = st.tabs(["📊 Dashboard", "📋 Stok", "🔁 Transaksi", "➕ Produk Baru"])
+t1, t2, t3, t4, t5 = st.tabs(["📊 Dashboard", "📈 Laporan & KPI", "📋 Stok", "🔁 Transaksi", "➕ Produk Baru"])
 with t1:
     tab_dashboard()
 with t2:
-    tab_stok()
+    tab_laporan()
 with t3:
-    tab_transaksi(operator)
+    tab_stok()
 with t4:
+    tab_transaksi(operator)
+with t5:
     tab_produk()
