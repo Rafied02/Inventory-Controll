@@ -46,14 +46,22 @@ def rp(x):
 
 # ---------- koneksi data ----------
 @st.cache_resource
+def _koneksi(sid, info_json):
+    import json
+
+    import gspread
+    from google.oauth2.service_account import Credentials
+    creds = Credentials.from_service_account_info(json.loads(info_json), scopes=SCOPES)
+    return gspread.authorize(creds).open_by_key(sid)
+
+
 def get_spreadsheet():
+    """Hasil 'tidak ada koneksi' sengaja TIDAK di-cache, supaya perubahan secrets langsung terbaca."""
     info, sid = secret("gcp_service_account"), secret("sheet_id")
     if not info or not sid:
         return None  # mode demo (CSV lokal)
-    import gspread
-    from google.oauth2.service_account import Credentials
-    creds = Credentials.from_service_account_info(dict(info), scopes=SCOPES)
-    return gspread.authorize(creds).open_by_key(sid)
+    import json
+    return _koneksi(sid, json.dumps(dict(info)))
 
 
 @st.cache_data(ttl=10)  # data dianggap "realtime" = maksimal 10 detik
@@ -109,7 +117,7 @@ def tambah_produk(data: dict):
 
 def diagnosa_secrets():
     """Tampilkan penyebab koneksi Google Sheet gagal (tanpa membocorkan isi secrets)."""
-    st.error("Secrets belum terbaca, jadi aplikasi belum bisa terhubung ke Google Sheet.")
+    st.error("Aplikasi belum terhubung ke Google Sheet.")
     kunci, galat = [], None
     try:
         kunci = list(st.secrets.keys())
