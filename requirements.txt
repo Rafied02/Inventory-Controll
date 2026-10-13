@@ -5,3 +5,4 @@ plotly
 gspread>=6.0
 google-auth
 openpyxl
+jinja2
