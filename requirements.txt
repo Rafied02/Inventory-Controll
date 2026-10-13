@@ -1,0 +1,6 @@
+streamlit>=1.37
+pandas
+numpy
+plotly
+gspread>=6.0
+google-auth
