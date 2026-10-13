@@ -20,7 +20,7 @@ from laporan import buat_excel, buat_html, hitung_laporan, KOL_ABC, KOL_DEAD, KO
 TZ = ZoneInfo("Asia/Jakarta")
 KOLOM_P = ["SKU", "Nama", "Kategori", "Supplier", "Lokasi",
            "Harga_Beli", "Harga_Jual", "Stok_Min", "Stok_Awal"]
-KOLOM_T = ["ID", "Waktu", "SKU", "Tipe", "Qty", "Operator", "Catatan"]
+KOLOM_T = ["ID", "Waktu", "SKU", "Tipe", "Qty", "Harga_Satuan", "Operator", "Catatan"]
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 REFRESH = "15s"  # interval auto-refresh dashboard
 
@@ -28,7 +28,6 @@ st.set_page_config(page_title="Inventory Pro", page_icon="📦", layout="wide")
 st.markdown("""
 <style>
 .block-container {padding-top: 1.5rem;}
-/* warna teks mengikuti tema Streamlit; latar & garis kartu semi-transparan agar aman di mode terang/gelap */
 div[data-testid="stMetric"] {background: rgba(128,128,128,0.10); border: 1px solid rgba(128,128,128,0.30);
   border-radius: 12px; padding: 14px 18px; min-height: 156px; display: flex; flex-direction: column; justify-content: center;}
 div[data-testid="stMetricValue"] {font-size: clamp(1.3rem, 1.9vw, 2rem);}
@@ -65,7 +64,6 @@ def rp_ringkas(x):
 @st.cache_resource
 def _koneksi(sid, info_json):
     import json
-
     import gspread
     from google.oauth2.service_account import Credentials
     creds = Credentials.from_service_account_info(json.loads(info_json), scopes=SCOPES)
@@ -73,7 +71,6 @@ def _koneksi(sid, info_json):
 
 
 def get_spreadsheet():
-    """Hasil 'tidak ada koneksi' sengaja TIDAK di-cache, supaya perubahan secrets langsung terbaca."""
     info, sid = secret("gcp_service_account"), secret("sheet_id")
     if not info or not sid:
         return None  # mode demo (CSV lokal)
@@ -81,7 +78,7 @@ def get_spreadsheet():
     return _koneksi(sid, json.dumps(dict(info)))
 
 
-@st.cache_data(ttl=10)  # data dianggap "realtime" = maksimal 10 detik
+@st.cache_data(ttl=10)
 def load_data():
     sh = get_spreadsheet()
     if sh:
@@ -92,7 +89,9 @@ def load_data():
     p, t = p.reindex(columns=KOLOM_P), t.reindex(columns=KOLOM_T)
     for c in ["Harga_Beli", "Harga_Jual", "Stok_Min", "Stok_Awal"]:
         p[c] = pd.to_numeric(p[c], errors="coerce").fillna(0)
-    t["Qty"] = pd.to_numeric(t["Qty"], errors="coerce").fillna(0)
+    for c in ["Qty", "Harga_Satuan"]:
+        if c in t.columns:
+            t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0)
     t["Waktu"] = pd.to_datetime(t["Waktu"], errors="coerce")
     return p, t
 
@@ -110,16 +109,46 @@ def hitung_stok(p, t):
     return p
 
 
-def tambah_transaksi(sku, tipe, qty, operator, catatan):
+def update_harga_beli_produk(sku, harga_baru):
+    sh = get_spreadsheet()
+    if sh:
+        ws = sh.worksheet("Produk")
+        cell = ws.find(sku)
+        if cell:
+            ws.update_cell(cell.row, 6, round(harga_baru, 2))  # Kolom 6 diasumsikan Harga_Beli
+    else:
+        p = pd.read_csv("data/produk.csv")
+        p.loc[p["SKU"] == sku, "Harga_Beli"] = round(harga_baru, 2)
+        p.to_csv("data/produk.csv", index=False)
+
+
+def tambah_transaksi(sku, tipe, qty, harga_satuan, operator, catatan):
+    p, t = load_data()
+    p_row = p[p["SKU"] == sku]
+    
+    # Jika transaksi Masuk dan ada harga beli baru, hitung Weighted Average untuk update master produk
+    if tipe == "Masuk" and harga_satuan > 0 and not p_row.empty:
+        delta = np.where(t["Tipe"] == "Keluar", -t["Qty"], t["Qty"])
+        net = pd.Series(delta, index=t.index).groupby(t["SKU"]).sum()
+        stok_saat_ini = int(p_row["Stok_Awal"].values[0] + net.get(sku, 0))
+        harga_lama = float(p_row["Harga_Beli"].values[0])
+        
+        if stok_saat_ini + qty > 0:
+            harga_baru_avg = ((stok_saat_ini * harga_lama) + (qty * harga_satuan)) / (stok_saat_ini + qty)
+        else:
+            harga_baru_avg = harga_satuan
+            
+        update_harga_beli_produk(sku, harga_baru_avg)
+
     row = [uuid.uuid4().hex[:8].upper(), datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-           sku, tipe, int(qty), operator, catatan]
+           sku, tipe, int(qty), float(harga_satuan), operator, catatan]
     sh = get_spreadsheet()
     if sh:
         sh.worksheet("Transaksi").append_row(row, value_input_option="RAW")
     else:
         pd.DataFrame([row], columns=KOLOM_T).to_csv("data/transaksi.csv", mode="a", header=False, index=False)
     load_data.clear()
-    catat_audit("TRANSAKSI", sku, dict(tipe=tipe, qty=int(qty), catatan=catatan))
+    catat_audit("TRANSAKSI", sku, dict(tipe=tipe, qty=int(qty), harga_satuan=harga_satuan, catatan=catatan))
 
 
 def tambah_produk(data: dict):
@@ -133,26 +162,23 @@ def tambah_produk(data: dict):
     catat_audit("PRODUK_TAMBAH", data["SKU"], data)
 
 
-
 def diagnosa_secrets():
-    """Tampilkan penyebab koneksi Google Sheet gagal (tanpa membocorkan isi secrets)."""
     st.error("Aplikasi belum terhubung ke Google Sheet.")
     kunci, galat = [], None
     try:
         kunci = list(st.secrets.keys())
-    except Exception as e:  # file secrets tidak ada atau format TOML salah
+    except Exception as e:
         galat = f"{type(e).__name__}: {str(e)[:150]}"
     st.write("**Kunci yang terbaca di Secrets:**", ", ".join(kunci) if kunci else "(kosong)")
     st.write("- `sheet_id`:", "✅ ada" if "sheet_id" in kunci else "❌ tidak ada")
     st.write("- `[gcp_service_account]`:", "✅ ada" if "gcp_service_account" in kunci else "❌ tidak ada")
     if galat:
         st.warning(f"Streamlit gagal membaca Secrets: {galat}")
-    st.info("Perbaikan: Manage app → Settings → Secrets → tempel ulang SELURUH isi secrets.toml "
-            "→ Save → Reboot app. Pastikan ada baris `sheet_id = ...` dan header `[gcp_service_account]`.")
+    st.info("Perbaikan: Manage app → Settings → Secrets → tempel ulang SELURUH isi secrets.toml.")
     st.stop()
 
 
-# ---------- tema warna (bisa diatur dari sidebar) ----------
+# ---------- tema warna ----------
 PRESET = {
     "Default": dict(masuk="#2563eb", keluar="#f97316", pendapatan="#2563eb", laba="#16a34a", utama="#6366f1", aksen="#f97316",
                     Aman="#16a34a", Menipis="#f59e0b", Kritis="#ef4444", Habis="#7f1d1d"),
@@ -185,7 +211,6 @@ def terang(h, f=0.6):
 
 
 def warnai_status(df):
-    """Beri warna sel kolom Status sesuai pilihan warna pengguna."""
     def f(v):
         return f"background-color: {W(v)}40; font-weight: 600" if v in STATUS else ""
     st_ = df.style
@@ -243,7 +268,6 @@ MAKS_GAGAL = 5
 
 
 def _ws(nama, kolom):
-    """Ambil worksheet; buat otomatis (dengan header) jika belum ada."""
     sh = get_spreadsheet()
     try:
         return sh.worksheet(nama)
@@ -312,7 +336,6 @@ def hapus_pengguna(username):
 
 
 def catat_audit(aksi, objek="", detail=None):
-    """Catat aktivitas. Kegagalan mencatat tidak boleh mengganggu pengguna."""
     try:
         u = st.session_state.get("user") or {}
         row = [datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"), u.get("username", "-"), aksi, str(objek),
@@ -335,7 +358,6 @@ def _masuk(u):
 
 
 def _form_password_baru(kunci):
-    """Field username/nama/password untuk akun baru; mengembalikan (data, error)."""
     un = st.text_input("Username", key=f"{kunci}_un").strip().lower()
     nm = st.text_input("Nama lengkap", key=f"{kunci}_nm").strip()
     p1 = st.text_input("Password", type="password", key=f"{kunci}_p1")
@@ -350,12 +372,12 @@ def cek_login():
     pengguna = muat_pengguna()
     st.title("📦 Inventory Pro")
 
-    if pengguna.empty:  # belum ada akun sama sekali
+    if pengguna.empty:
         if not kode:
             if get_spreadsheet():
                 st.error("Belum ada pengguna. Isi `app_password` di Secrets sebagai kode setup, lalu reboot app.")
                 st.stop()
-            st.session_state["user"] = dict(username="demo", nama="Demo", peran="admin")  # demo lokal
+            st.session_state["user"] = dict(username="demo", nama="Demo", peran="admin")
             st.rerun()
         st.subheader("Setup awal: buat akun admin pertama")
         with st.form("setup"):
@@ -489,16 +511,20 @@ def tab_transaksi(operator, admin=False):
     p = hitung_stok(p, t)
     st.subheader("Catat Transaksi")
     with st.form("form_trx", clear_on_submit=True):
-        c = st.columns([3, 2, 1, 3])
+        c = st.columns([3, 2, 1, 2, 3])
         pilih = c[0].selectbox("Produk", p["SKU"] + " · " + p["Nama"])
         tipe = c[1].selectbox("Tipe", ["Masuk", "Keluar"] + (["Penyesuaian"] if admin else []))
         qty = c[2].number_input("Qty", value=1, step=1,
                                 help="Penyesuaian boleh negatif (koreksi stock opname).")
-        cat = c[3].text_input("Catatan")
+        harga_masuk_baru = c[3].number_input("Harga Beli (Rp)", min_value=0.0, step=1000.0,
+                                             help="Isi harga beli satuan baru khusus jika barang Masuk.")
+        cat = c[4].text_input("Catatan")
         kirim = st.form_submit_button("Simpan", type="primary")
+        
     if kirim:
         sku = pilih.split(" · ")[0]
         stok_now = int(p.loc[p["SKU"] == sku, "Stok"].iloc[0])
+        
         if tipe != "Penyesuaian" and qty <= 0:
             st.error("Qty harus lebih dari 0.")
         elif tipe == "Penyesuaian" and qty == 0:
@@ -508,8 +534,9 @@ def tab_transaksi(operator, admin=False):
         elif tipe == "Penyesuaian" and stok_now + qty < 0:
             st.error("Penyesuaian membuat stok negatif.")
         else:
-            tambah_transaksi(sku, tipe, qty, operator, cat)
-            st.success("Transaksi tersimpan.")
+            h_satuan = harga_masuk_baru if tipe == "Masuk" else 0.0
+            tambah_transaksi(sku, tipe, qty, h_satuan, operator, cat)
+            st.success("Transaksi berhasil disimpan.")
             st.rerun()
 
     st.subheader("Riwayat Terbaru")
@@ -517,8 +544,9 @@ def tab_transaksi(operator, admin=False):
     ft = st.multiselect("Filter tipe", ["Masuk", "Keluar", "Penyesuaian"], key="ft")
     if ft:
         r = r[r["Tipe"].isin(ft)]
-    st.dataframe(r[["Waktu", "ID", "SKU", "Nama", "Tipe", "Qty", "Operator", "Catatan"]].head(100),
-                 hide_index=True, use_container_width=True)
+    st.dataframe(r[["Waktu", "ID", "SKU", "Nama", "Tipe", "Qty", "Harga_Satuan", "Operator", "Catatan"]].head(100),
+                 hide_index=True, use_container_width=True,
+                 column_config={"Harga_Satuan": st.column_config.NumberColumn("Harga Masuk", format="Rp %d")})
 
 
 # ---------- tab: produk baru ----------
@@ -549,7 +577,6 @@ def tab_produk():
                                Harga_Beli=hb, Harga_Jual=hj, Stok_Min=smin, Stok_Awal=awal))
             st.success("Produk ditambahkan.")
             st.rerun()
-
 
 
 # ---------- tab: laporan & KPI ----------
@@ -705,8 +732,7 @@ def tab_pengguna():
                         st.success("Perubahan disimpan.")
 
             with st.expander("🗑️ Hapus pengguna"):
-                st.caption("Penghapusan permanen. Riwayat transaksi dan log audit tetap tersimpan (nama operator tercatat sebagai teks). "
-                           "Jika hanya ingin mencabut akses, cukup nonaktifkan akun.")
+                st.caption("Penghapusan permanen. Riwayat transaksi dan log audit tetap tersimpan.")
                 konfirmasi = st.text_input(f"Ketik `{pilih}` untuk konfirmasi", key=f"hapus_{pilih}")
                 if st.button("Hapus permanen", key=f"btn_hapus_{pilih}"):
                     admin_lain = pengguna[(pengguna["Peran"] == "admin") & (pengguna["Aktif"].str.upper() != "N") & (pengguna["Username"] != pilih)]
@@ -788,7 +814,7 @@ with st.sidebar:
                 st.error(f"Gagal menyimpan: {type(e).__name__}")
 
 st.title("Sistem Inventory")
-daftar = [  # (judul, fungsi, khusus admin)
+daftar = [
     ("📊 Dashboard", tab_dashboard, False),
     ("📈 Laporan & KPI", tab_laporan, True),
     ("📋 Stok", tab_stok, False),
