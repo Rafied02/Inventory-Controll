@@ -1,4 +1,5 @@
 """Inventory Pro - sistem inventory realtime & interaktif (Streamlit + Google Sheets)."""
+import os
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -104,6 +105,24 @@ def tambah_produk(data: dict):
         pd.DataFrame([row], columns=KOLOM_P).to_csv("data/produk.csv", mode="a", header=False, index=False)
     load_data.clear()
 
+
+
+def diagnosa_secrets():
+    """Tampilkan penyebab koneksi Google Sheet gagal (tanpa membocorkan isi secrets)."""
+    st.error("Secrets belum terbaca, jadi aplikasi belum bisa terhubung ke Google Sheet.")
+    kunci, galat = [], None
+    try:
+        kunci = list(st.secrets.keys())
+    except Exception as e:  # file secrets tidak ada atau format TOML salah
+        galat = f"{type(e).__name__}: {str(e)[:150]}"
+    st.write("**Kunci yang terbaca di Secrets:**", ", ".join(kunci) if kunci else "(kosong)")
+    st.write("- `sheet_id`:", "✅ ada" if "sheet_id" in kunci else "❌ tidak ada")
+    st.write("- `[gcp_service_account]`:", "✅ ada" if "gcp_service_account" in kunci else "❌ tidak ada")
+    if galat:
+        st.warning(f"Streamlit gagal membaca Secrets: {galat}")
+    st.info("Perbaikan: Manage app → Settings → Secrets → tempel ulang SELURUH isi secrets.toml "
+            "→ Save → Reboot app. Pastikan ada baris `sheet_id = ...` dan header `[gcp_service_account]`.")
+    st.stop()
 
 # ---------- login (opsional) ----------
 def cek_login():
@@ -371,6 +390,9 @@ with st.sidebar:
     if st.button("🔄 Refresh sekarang"):
         load_data.clear()
         st.rerun()
+
+if not get_spreadsheet() and not os.path.exists("data/produk.csv"):
+    diagnosa_secrets()
 
 st.title("Sistem Inventory")
 t1, t2, t3, t4, t5 = st.tabs(["📊 Dashboard", "📈 Laporan & KPI", "📋 Stok", "🔁 Transaksi", "➕ Produk Baru"])
