@@ -24,10 +24,13 @@ st.set_page_config(page_title="Inventory Pro", page_icon="📦", layout="wide")
 st.markdown("""
 <style>
 .block-container {padding-top: 1.5rem;}
-div[data-testid="stMetric"] {background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:14px 18px;}
-@media (prefers-color-scheme: dark){
-  div[data-testid="stMetric"] {background:#1e293b;border-color:#334155;}
-}
+/* warna teks mengikuti tema Streamlit; latar & garis kartu semi-transparan agar aman di mode terang/gelap */
+div[data-testid="stMetric"] {background: rgba(128,128,128,0.10); border: 1px solid rgba(128,128,128,0.30);
+  border-radius: 12px; padding: 14px 18px;}
+div[data-testid="stMetricValue"] {font-size: clamp(1.3rem, 1.9vw, 2rem);}
+div[data-testid="stMetricValue"] > div {white-space: normal !important; overflow: visible !important;
+  text-overflow: clip !important; line-height: 1.2;}
+div[data-testid="stMetricLabel"] p {white-space: normal !important;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -42,6 +45,16 @@ def secret(key, default=None):
 
 def rp(x):
     return "Rp " + f"{x:,.0f}".replace(",", ".")
+
+
+def rp_ringkas(x):
+    """Rp 395,9 jt / Rp 1,2 M, supaya muat di kartu KPI."""
+    a = abs(x)
+    for batas, satuan in ((1e12, " T"), (1e9, " M"), (1e6, " jt")):
+        if a >= batas:
+            v = f"{x / batas:,.1f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            return f"Rp {v}{satuan}"
+    return rp(x)
 
 
 # ---------- koneksi data ----------
@@ -159,7 +172,7 @@ def tab_dashboard():
     k = st.columns(5)
     k[0].metric("Total SKU", len(p))
     k[1].metric("Total Unit", f"{p['Stok'].sum():,}".replace(",", "."))
-    k[2].metric("Nilai Persediaan", rp(p["Nilai_Stok"].sum()))
+    k[2].metric("Nilai Persediaan", rp_ringkas(p["Nilai_Stok"].sum()), help=rp(p["Nilai_Stok"].sum()))
     k[3].metric("Stok Kritis/Habis", len(perlu))
     hari_ini = t[t["Waktu"].dt.date == datetime.now(TZ).date()]
     k[4].metric("Transaksi Hari Ini", len(hari_ini))
@@ -323,20 +336,20 @@ def tab_laporan():
 
     st.subheader("KPI Utama")
     m = st.columns(4)
-    m[0].metric("Pendapatan", rp(k["pendapatan"]), delta(k["pendapatan"], k["pendapatan_prev"]))
-    m[1].metric("HPP", rp(k["hpp"]), delta(k["hpp"], k["hpp_prev"]), delta_color="off")
-    m[2].metric("Laba Kotor", rp(k["laba"]), delta(k["laba"], k["laba_prev"]))
+    m[0].metric("Pendapatan", rp_ringkas(k["pendapatan"]), delta(k["pendapatan"], k["pendapatan_prev"]))
+    m[1].metric("HPP", rp_ringkas(k["hpp"]), delta(k["hpp"], k["hpp_prev"]), delta_color="off")
+    m[2].metric("Laba Kotor", rp_ringkas(k["laba"]), delta(k["laba"], k["laba_prev"]))
     m[3].metric("Margin Kotor", f"{k['margin']:.1f}%", f"{k['margin'] - k['margin_prev']:+.1f} poin")
     m = st.columns(4)
     m[0].metric("Inventory Turnover", f"{k['turnover']:.2f}x", f"setahun ≈ {k['turnover_tahunan']:.1f}x", delta_color="off")
     m[1].metric("Days of Inventory", "-" if pd.isna(k["doi"]) else f"{k['doi']:.0f} hari")
     m[2].metric("Sell-Through", f"{k['sell_through']:.1f}%")
-    m[3].metric("Nilai Persediaan", rp(k["nilai_stok"]))
+    m[3].metric("Nilai Persediaan", rp_ringkas(k["nilai_stok"]))
     m = st.columns(4)
     m[0].metric("Stockout Rate", f"{k['stockout']:.1f}%")
-    m[1].metric("Dead Stock", rp(k["dead_nilai"]), f"{k['dead_sku']} SKU", delta_color="off")
+    m[1].metric("Dead Stock", rp_ringkas(k["dead_nilai"]), f"{k['dead_sku']} SKU", delta_color="off")
     m[2].metric("Unit Masuk / Keluar", f"{k['unit_masuk']:,.0f} / {k['unit_keluar']:,.0f}".replace(",", "."))
-    m[3].metric("Perlu Restock", f"{k['restock_sku']} SKU", f"≈ {rp(k['restock_biaya'])}", delta_color="off")
+    m[3].metric("Perlu Restock", f"{k['restock_sku']} SKU", f"≈ {rp_ringkas(k['restock_biaya'])}", delta_color="off")
 
     st.subheader("Scorecard KPI vs Target")
     st.dataframe(h["skor"], hide_index=True, use_container_width=True)
@@ -347,7 +360,7 @@ def tab_laporan():
     fig.update_layout(height=340, margin=dict(t=50, b=10, l=10, r=10), legend_title=None, yaxis_title="Rp")
     c1.plotly_chart(fig, use_container_width=True)
     fig = px.bar(h["kategori"].sort_values("Laba"), x="Laba", y="Kategori", orientation="h", color="Margin_%",
-                 color_continuous_scale="Blues", title="Laba & Margin per Kategori")
+                 color_continuous_scale=["#93c5fd", "#1d4ed8"], title="Laba & Margin per Kategori")
     fig.update_layout(height=340, margin=dict(t=50, b=10, l=10, r=10), coloraxis_colorbar_title="Margin %")
     c2.plotly_chart(fig, use_container_width=True)
 
