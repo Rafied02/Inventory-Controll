@@ -1,4 +1,13 @@
-"""Perhitungan KPI & laporan inventory (murni pandas, tanpa Streamlit agar mudah diuji)."""
+"""Perhitungan KPI & laporan inventory (murni pandas, tanpa Streamlit agar mudah diuji).
+
+Prinsip: biaya (HPP & nilai persediaan) TIDAK diambil dari Harga_Beli master yang bisa berubah,
+tetapi dihitung ulang dari seluruh transaksi dengan metode biaya rata-rata bergerak.
+  - Harga_Beli di tab Produk = biaya awal untuk Stok_Awal.
+  - Transaksi Masuk membawa Harga_Satuan (0 = bonus; kosong = data lama, biaya tidak berubah).
+  - Transaksi Keluar dicatat dengan biaya rata-rata PADA SAAT ITU.
+Akibatnya laporan periode lama tidak berubah saat harga beli baru masuk, dan edit/hapus transaksi
+otomatis konsisten karena semuanya dihitung ulang dari data transaksi.
+"""
 import io
 from datetime import datetime
 
@@ -10,50 +19,117 @@ def rp(x):
     return "Rp " + f"{x:,.0f}".replace(",", ".")
 
 
-def stok_pada(p, t, waktu):
-    """Stok setiap SKU (urutan sama dengan p) tepat sebelum `waktu`."""
-    tt = t[t["Waktu"] < waktu]
-    d = np.where(tt["Tipe"] == "Keluar", -tt["Qty"], tt["Qty"])
-    net = pd.Series(d, index=tt.index).groupby(tt["SKU"]).sum()
-    return p["Stok_Awal"] + p["SKU"].map(net).fillna(0)
+# ---------- buku persediaan (biaya rata-rata bergerak) ----------
+def buat_buku(p, t):
+    """Tambahkan Biaya_Satuan, Stok_Setelah, Avg_Setelah, Nilai_Setelah ke setiap transaksi (urut waktu)."""
+    t = t.copy()
+    if "Harga_Satuan" not in t.columns:
+        t["Harga_Satuan"] = np.nan
+    t["Harga_Satuan"] = pd.to_numeric(t["Harga_Satuan"], errors="coerce")
+    t["Qty"] = pd.to_numeric(t["Qty"], errors="coerce").fillna(0)
+    t = t.sort_values(["Waktu", "ID"], kind="stable", na_position="last").reset_index(drop=True)
+
+    state = {r.SKU: [float(r.Stok_Awal), float(r.Harga_Beli)] for r in p[["SKU", "Stok_Awal", "Harga_Beli"]].itertuples()}
+    biaya, stok_s, avg_s = [], [], []
+    for r in t.itertuples():
+        s = state.get(r.SKU)
+        if s is None:  # SKU tidak dikenal
+            biaya.append(np.nan); stok_s.append(np.nan); avg_s.append(np.nan)
+            continue
+        qty, avg = s
+        q = float(r.Qty)
+        if r.Tipe == "Masuk":
+            harga = avg if pd.isna(r.Harga_Satuan) else float(r.Harga_Satuan)
+            dasar = max(qty, 0.0)
+            avg = (dasar * avg + q * harga) / (dasar + q) if (dasar + q) > 0 else harga
+            qty += q
+            b = harga
+        elif r.Tipe == "Keluar":
+            qty -= q
+            b = avg
+        else:  # Penyesuaian (bertanda), biaya rata-rata tetap
+            qty += q
+            b = avg
+        s[0], s[1] = qty, avg
+        biaya.append(b); stok_s.append(qty); avg_s.append(avg)
+    t["Biaya_Satuan"], t["Stok_Setelah"], t["Avg_Setelah"] = biaya, stok_s, avg_s
+    t["Nilai_Setelah"] = t["Stok_Setelah"].clip(lower=0) * t["Avg_Setelah"]
+    return t
 
 
-def _keluar(p, t, mulai, akhir):
-    x = t[(t["Waktu"] >= mulai) & (t["Waktu"] < akhir) & (t["Tipe"] == "Keluar")]
-    x = x.merge(p[["SKU", "Harga_Beli", "Harga_Jual"]], on="SKU", how="left")
-    return x, float((x["Qty"] * x["Harga_Jual"]).sum()), float((x["Qty"] * x["Harga_Beli"]).sum())
+def hitung_stok(p, t):
+    """Stok, biaya rata-rata (Harga_Rata2), nilai persediaan, status & level per produk."""
+    buku = buat_buku(p, t)
+    akhir = buku.dropna(subset=["Stok_Setelah"]).groupby("SKU").tail(1).set_index("SKU")
+    p = p.copy()
+    p["Stok"] = p["SKU"].map(akhir["Stok_Setelah"]).fillna(p["Stok_Awal"]).round().astype(int)
+    p["Harga_Rata2"] = p["SKU"].map(akhir["Avg_Setelah"]).fillna(p["Harga_Beli"])
+    p["Nilai_Stok"] = p["Stok"].clip(lower=0) * p["Harga_Rata2"]
+    p["Status"] = np.select(
+        [p["Stok"] <= 0, p["Stok"] <= p["Stok_Min"], p["Stok"] <= p["Stok_Min"] * 1.5],
+        ["Habis", "Kritis", "Menipis"], "Aman")
+    p["Level"] = (p["Stok"] / (p["Stok_Min"].replace(0, 1) * 3)).clip(0, 1) * 100
+    return p
+
+
+def stok_negatif(p, t):
+    """Daftar SKU yang stoknya pernah negatif di riwayat (untuk validasi edit/hapus transaksi)."""
+    buku = buat_buku(p, t)
+    minimum = buku.dropna(subset=["Stok_Setelah"]).groupby("SKU")["Stok_Setelah"].min()
+    return minimum[minimum < 0].index.tolist()
+
+
+def posisi_pada(buku, p, waktu):
+    """(stok, nilai persediaan) tiap produk tepat sebelum `waktu`, urutan sama dengan p."""
+    sebelum = buku[(buku["Waktu"] < waktu)].dropna(subset=["Stok_Setelah"])
+    terakhir = sebelum.groupby("SKU").tail(1).set_index("SKU")
+    stok = p["SKU"].map(terakhir["Stok_Setelah"]).fillna(p["Stok_Awal"])
+    nilai = p["SKU"].map(terakhir["Nilai_Setelah"]).fillna(p["Stok_Awal"].clip(lower=0) * p["Harga_Beli"])
+    return stok, nilai
+
+
+def _keluar(buku, p, mulai, akhir):
+    x = buku[(buku["Waktu"] >= mulai) & (buku["Waktu"] < akhir) & (buku["Tipe"] == "Keluar")]
+    x = x.merge(p[["SKU", "Harga_Jual"]], on="SKU", how="left")
+    x["Pendapatan"] = x["Qty"] * x["Harga_Jual"].fillna(0)
+    x["HPP"] = x["Qty"] * x["Biaya_Satuan"].fillna(0)
+    return x
 
 
 def hitung_laporan(p, t, mulai, akhir, lead=7, cover=14):
-    """p = hasil hitung_stok() (punya Stok, Status, Nilai_Stok). mulai/akhir: pd.Timestamp, akhir eksklusif."""
+    """p = hasil hitung_stok(). mulai/akhir: pd.Timestamp, akhir eksklusif."""
+    buku = buat_buku(p, t)
     n = max((akhir - mulai).days, 1)
-    x, rev, cogs = _keluar(p, t, mulai, akhir)
-    _, rev0, cogs0 = _keluar(p, t, mulai - (akhir - mulai), mulai)
+    x = _keluar(buku, p, mulai, akhir)
+    x0 = _keluar(buku, p, mulai - (akhir - mulai), mulai)
+    rev, cogs = float(x["Pendapatan"].sum()), float(x["HPP"].sum())
+    rev0, cogs0 = float(x0["Pendapatan"].sum()), float(x0["HPP"].sum())
 
-    # --- inventory turnover & DOI ---
-    s0, s1 = stok_pada(p, t, mulai), stok_pada(p, t, akhir)
-    avg_val = float(((s0 + s1) / 2 * p["Harga_Beli"]).sum())
+    # --- inventory turnover & DOI (nilai persediaan dari buku, bukan harga master) ---
+    stok0, nilai0 = posisi_pada(buku, p, mulai)
+    stok1, nilai1 = posisi_pada(buku, p, akhir)
+    avg_val = float((nilai0.sum() + nilai1.sum()) / 2)
     turnover = cogs / avg_val if avg_val > 0 else 0.0
     turnover_tahunan = turnover * 365 / n
     doi = n / turnover if turnover > 0 else np.nan
 
-    in_per = t[(t["Waktu"] >= mulai) & (t["Waktu"] < akhir)]
+    in_per = buku[(buku["Waktu"] >= mulai) & (buku["Waktu"] < akhir)]
     masuk = float(in_per.loc[in_per["Tipe"] == "Masuk", "Qty"].sum())
     keluar_qty = float(x["Qty"].sum())
-    tersedia = float(s0.clip(lower=0).sum()) + masuk
+    tersedia = float(stok0.clip(lower=0).sum()) + masuk
     sell_through = keluar_qty / tersedia * 100 if tersedia > 0 else 0.0
 
     # --- tabel per SKU ---
-    per = x.groupby("SKU")["Qty"].sum().rename("Qty_Keluar")
+    per = x.groupby("SKU").agg(Qty_Keluar=("Qty", "sum"), Pendapatan=("Pendapatan", "sum"), HPP=("HPP", "sum"))
     base = p.merge(per, on="SKU", how="left")
-    base["Qty_Keluar"] = base["Qty_Keluar"].fillna(0)
-    base["Pendapatan"] = base["Qty_Keluar"] * base["Harga_Jual"]
-    base["HPP"] = base["Qty_Keluar"] * base["Harga_Beli"]
+    for c in ["Qty_Keluar", "Pendapatan", "HPP"]:
+        base[c] = base[c].fillna(0)
     base["Laba"] = base["Pendapatan"] - base["HPP"]
     base["Rata2_Harian"] = base["Qty_Keluar"] / n
     base["Cakupan_Hari"] = np.where(base["Rata2_Harian"] > 0, base["Stok"] / base["Rata2_Harian"].replace(0, np.nan), np.nan)
     base["Saran_Order"] = np.ceil(np.maximum(0, base["Rata2_Harian"] * (lead + cover) - base["Stok"])).astype(int)
-    base["Est_Biaya"] = base["Saran_Order"] * base["Harga_Beli"]
+    harga_ref = base["Harga_Rata2"] if "Harga_Rata2" in base.columns else base["Harga_Beli"]
+    base["Est_Biaya"] = base["Saran_Order"] * harga_ref
 
     abc = base[base["Pendapatan"] > 0].sort_values("Pendapatan", ascending=False).copy()
     if not abc.empty:
@@ -66,8 +142,7 @@ def hitung_laporan(p, t, mulai, akhir, lead=7, cover=14):
     restock = base[base["Saran_Order"] > 0].sort_values("Cakupan_Hari")
     dead = base[(base["Stok"] > 0) & (base["Qty_Keluar"] == 0)].sort_values("Nilai_Stok", ascending=False)
 
-    harian = x.assign(Tanggal=x["Waktu"].dt.date, Pendapatan=x["Qty"] * x["Harga_Jual"],
-                      Laba=x["Qty"] * (x["Harga_Jual"] - x["Harga_Beli"]))
+    harian = x.assign(Tanggal=x["Waktu"].dt.date, Laba=x["Pendapatan"] - x["HPP"])
     harian = harian.groupby("Tanggal")[["Pendapatan", "Laba"]].sum().reset_index()
 
     kategori = base.groupby("Kategori")[["Pendapatan", "HPP", "Laba", "Nilai_Stok"]].sum().reset_index()
