@@ -1,5 +1,7 @@
 """Inventory Pro - sistem inventory realtime & interaktif (Streamlit + Google Sheets)."""
+import json
 import os
+import re
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -16,7 +18,6 @@ TZ = ZoneInfo("Asia/Jakarta")
 KOLOM_P = ["SKU", "Nama", "Kategori", "Supplier", "Lokasi",
            "Harga_Beli", "Harga_Jual", "Stok_Min", "Stok_Awal"]
 KOLOM_T = ["ID", "Waktu", "SKU", "Tipe", "Qty", "Operator", "Catatan"]
-WARNA = {"Aman": "#16a34a", "Menipis": "#f59e0b", "Kritis": "#ef4444", "Habis": "#7f1d1d"}
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 REFRESH = "15s"  # interval auto-refresh dashboard
 
@@ -26,7 +27,7 @@ st.markdown("""
 .block-container {padding-top: 1.5rem;}
 /* warna teks mengikuti tema Streamlit; latar & garis kartu semi-transparan agar aman di mode terang/gelap */
 div[data-testid="stMetric"] {background: rgba(128,128,128,0.10); border: 1px solid rgba(128,128,128,0.30);
-  border-radius: 12px; padding: 14px 18px;}
+  border-radius: 12px; padding: 14px 18px; min-height: 156px; display: flex; flex-direction: column; justify-content: center;}
 div[data-testid="stMetricValue"] {font-size: clamp(1.3rem, 1.9vw, 2rem);}
 div[data-testid="stMetricValue"] > div {white-space: normal !important; overflow: visible !important;
   text-overflow: clip !important; line-height: 1.2;}
@@ -145,6 +146,90 @@ def diagnosa_secrets():
             "→ Save → Reboot app. Pastikan ada baris `sheet_id = ...` dan header `[gcp_service_account]`.")
     st.stop()
 
+
+# ---------- tema warna (bisa diatur dari sidebar) ----------
+PRESET = {
+    "Default": dict(masuk="#2563eb", keluar="#f97316", pendapatan="#2563eb", laba="#16a34a", utama="#6366f1", aksen="#f97316",
+                    Aman="#16a34a", Menipis="#f59e0b", Kritis="#ef4444", Habis="#7f1d1d"),
+    "Ocean": dict(masuk="#0284c7", keluar="#0d9488", pendapatan="#0369a1", laba="#14b8a6", utama="#0891b2", aksen="#6366f1",
+                  Aman="#0d9488", Menipis="#eab308", Kritis="#f43f5e", Habis="#881337"),
+    "Sunset": dict(masuk="#e11d48", keluar="#f59e0b", pendapatan="#db2777", laba="#f97316", utama="#e11d48", aksen="#f59e0b",
+                   Aman="#65a30d", Menipis="#f59e0b", Kritis="#dc2626", Habis="#7f1d1d"),
+    "Forest": dict(masuk="#15803d", keluar="#a16207", pendapatan="#166534", laba="#84cc16", utama="#15803d", aksen="#ca8a04",
+                   Aman="#16a34a", Menipis="#eab308", Kritis="#ea580c", Habis="#7f1d1d"),
+    "Monokrom": dict(masuk="#334155", keluar="#94a3b8", pendapatan="#1e293b", laba="#64748b", utama="#475569", aksen="#94a3b8",
+                     Aman="#64748b", Menipis="#94a3b8", Kritis="#334155", Habis="#0f172a"),
+}
+LABEL_WARNA = {"masuk": "Barang masuk", "keluar": "Barang keluar", "pendapatan": "Pendapatan", "laba": "Laba",
+               "utama": "Warna utama grafik", "aksen": "Warna aksen grafik", "Aman": "Status Aman",
+               "Menipis": "Status Menipis", "Kritis": "Status Kritis", "Habis": "Status Habis"}
+STATUS = ("Aman", "Menipis", "Kritis", "Habis")
+
+
+def W(k):
+    return st.session_state.get(f"w_{k}", PRESET["Default"][k])
+
+
+def warna_status():
+    return {k: W(k) for k in STATUS}
+
+
+def terang(h, f=0.6):
+    r, g, b = (int(h[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(int(c + (255 - c) * f) for c in (r, g, b))
+
+
+def warnai_status(df):
+    """Beri warna sel kolom Status sesuai pilihan warna pengguna."""
+    def f(v):
+        return f"background-color: {W(v)}40; font-weight: 600" if v in STATUS else ""
+    st_ = df.style
+    return (st_.map if hasattr(st_, "map") else st_.applymap)(f, subset=["Status"])
+
+
+def muat_tema():
+    try:
+        sh = get_spreadsheet()
+        if sh:
+            data = json.loads(sh.worksheet("Pengaturan").acell("A1").value or "{}")
+        elif os.path.exists("data/tema.json"):
+            data = json.load(open("data/tema.json", encoding="utf-8"))
+        else:
+            return {}
+        return {k: v for k, v in data.items() if k in PRESET["Default"] and re.fullmatch(r"#[0-9a-fA-F]{6}", str(v))}
+    except Exception:
+        return {}
+
+
+def simpan_tema():
+    data = {k: W(k) for k in PRESET["Default"]}
+    sh = get_spreadsheet()
+    if sh:
+        try:
+            ws = sh.worksheet("Pengaturan")
+        except Exception:
+            ws = sh.add_worksheet("Pengaturan", rows=5, cols=2)
+        ws.update_acell("A1", json.dumps(data))
+    else:
+        json.dump(data, open("data/tema.json", "w", encoding="utf-8"))
+
+
+def terapkan_preset():
+    for k, v in PRESET[st.session_state["preset"]].items():
+        st.session_state[f"w_{k}"] = v
+
+
+def reset_tema():
+    st.session_state["preset"] = "Default"
+    terapkan_preset()
+
+
+def init_tema():
+    if "w_masuk" not in st.session_state:
+        for k, v in {**PRESET["Default"], **muat_tema()}.items():
+            st.session_state[f"w_{k}"] = v
+
+
 # ---------- login (opsional) ----------
 def cek_login():
     pw = secret("app_password")
@@ -182,21 +267,21 @@ def tab_dashboard():
     t30 = t[(t["Waktu"] >= batas) & t["Tipe"].isin(["Masuk", "Keluar"])]
     harian = t30.groupby([t30["Waktu"].dt.date.rename("Tanggal"), "Tipe"])["Qty"].sum().reset_index()
     fig = px.bar(harian, x="Tanggal", y="Qty", color="Tipe", barmode="group",
-                 color_discrete_map={"Masuk": "#2563eb", "Keluar": "#f97316"},
+                 color_discrete_map={"Masuk": W("masuk"), "Keluar": W("keluar")},
                  title="Pergerakan Stok 30 Hari Terakhir")
     fig.update_layout(height=340, margin=dict(t=50, b=10, l=10, r=10), legend_title=None)
     c1.plotly_chart(fig, use_container_width=True)
 
     stat = p["Status"].value_counts().reset_index()
     fig = px.pie(stat, names="Status", values="count", hole=0.55, color="Status",
-                 color_discrete_map=WARNA, title="Kesehatan Stok")
+                 color_discrete_map=warna_status(), title="Kesehatan Stok")
     fig.update_layout(height=340, margin=dict(t=50, b=10, l=10, r=10))
     c2.plotly_chart(fig, use_container_width=True)
 
     c3, c4 = st.columns(2)
     kat = p.groupby("Kategori")["Nilai_Stok"].sum().reset_index().sort_values("Nilai_Stok")
     fig = px.bar(kat, x="Nilai_Stok", y="Kategori", orientation="h", title="Nilai Persediaan per Kategori",
-                 color_discrete_sequence=["#6366f1"])
+                 color_discrete_sequence=[W("utama")])
     fig.update_layout(height=320, margin=dict(t=50, b=10, l=10, r=10), xaxis_title="Rp")
     c3.plotly_chart(fig, use_container_width=True)
 
@@ -204,7 +289,7 @@ def tab_dashboard():
     top = p.set_index("SKU").join(keluar.rename("Terjual")).dropna(subset=["Terjual"])
     top = top.nlargest(10, "Terjual").reset_index().sort_values("Terjual")
     fig = px.bar(top, x="Terjual", y="Nama", orientation="h", title="Top 10 Produk Keluar (30 hari)",
-                 color_discrete_sequence=["#f97316"])
+                 color_discrete_sequence=[W("aksen")])
     fig.update_layout(height=320, margin=dict(t=50, b=10, l=10, r=10), yaxis_title=None)
     c4.plotly_chart(fig, use_container_width=True)
 
@@ -213,8 +298,7 @@ def tab_dashboard():
         st.success("Semua stok dalam kondisi aman.")
     else:
         tampil = perlu.assign(Kekurangan=(perlu["Stok_Min"] * 2 - perlu["Stok"]).clip(lower=0).astype(int))
-        st.dataframe(tampil[["SKU", "Nama", "Supplier", "Stok", "Stok_Min", "Status", "Kekurangan"]]
-                     .sort_values("Stok"), hide_index=True, use_container_width=True)
+        st.dataframe(warnai_status(tampil[["SKU", "Nama", "Supplier", "Stok", "Stok_Min", "Status", "Kekurangan"]].sort_values("Stok")), hide_index=True, use_container_width=True)
 
 
 # ---------- tab: stok ----------
@@ -233,7 +317,7 @@ def tab_stok():
     if cari:
         d = d[d["Nama"].str.contains(cari, case=False) | d["SKU"].str.contains(cari, case=False)]
     st.dataframe(
-        d[["SKU", "Nama", "Kategori", "Lokasi", "Stok", "Stok_Min", "Level", "Status", "Harga_Beli", "Harga_Jual", "Nilai_Stok"]],
+        warnai_status(d[["SKU", "Nama", "Kategori", "Lokasi", "Stok", "Stok_Min", "Level", "Status", "Harga_Beli", "Harga_Jual", "Nilai_Stok"]]),
         hide_index=True, use_container_width=True,
         column_config={
             "Level": st.column_config.ProgressColumn("Level Stok", min_value=0, max_value=100, format="%d%%"),
@@ -356,11 +440,11 @@ def tab_laporan():
 
     c1, c2 = st.columns(2)
     fig = px.line(h["harian"], x="Tanggal", y=["Pendapatan", "Laba"], markers=True, title="Tren Pendapatan & Laba Harian",
-                  color_discrete_sequence=["#2563eb", "#16a34a"])
+                  color_discrete_sequence=[W("pendapatan"), W("laba")])
     fig.update_layout(height=340, margin=dict(t=50, b=10, l=10, r=10), legend_title=None, yaxis_title="Rp")
     c1.plotly_chart(fig, use_container_width=True)
     fig = px.bar(h["kategori"].sort_values("Laba"), x="Laba", y="Kategori", orientation="h", color="Margin_%",
-                 color_continuous_scale=["#93c5fd", "#1d4ed8"], title="Laba & Margin per Kategori")
+                 color_continuous_scale=[terang(W("utama")), W("utama")], title="Laba & Margin per Kategori")
     fig.update_layout(height=340, margin=dict(t=50, b=10, l=10, r=10), coloraxis_colorbar_title="Margin %")
     c2.plotly_chart(fig, use_container_width=True)
 
@@ -369,11 +453,11 @@ def tab_laporan():
     if abc.empty:
         st.info("Belum ada penjualan pada periode ini.")
     else:
-        warna = {"A": "#2563eb", "B": "#f59e0b", "C": "#94a3b8"}
+        warna = {"A": W("utama"), "B": W("aksen"), "C": "#94a3b8"}
         fig = go.Figure()
         fig.add_bar(x=abc["SKU"], y=abc["Pendapatan"], marker_color=abc["Kelas"].map(warna), name="Pendapatan",
                     customdata=abc[["Nama", "Kelas"]], hovertemplate="%{customdata[0]}<br>Kelas %{customdata[1]}<br>Rp %{y:,.0f}<extra></extra>")
-        fig.add_scatter(x=abc["SKU"], y=abc["Kum_%"], yaxis="y2", mode="lines+markers", name="Kumulatif %", line=dict(color="#ef4444"))
+        fig.add_scatter(x=abc["SKU"], y=abc["Kum_%"], yaxis="y2", mode="lines+markers", name="Kumulatif %", line=dict(color=W("Kritis")))
         fig.update_layout(height=360, margin=dict(t=30, b=10, l=10, r=10), yaxis2=dict(overlaying="y", side="right", range=[0, 105], title="%"),
                           yaxis_title="Rp", legend=dict(orientation="h", y=1.12))
         st.plotly_chart(fig, use_container_width=True)
@@ -401,6 +485,7 @@ def tab_laporan():
 
 # ---------- main ----------
 cek_login()
+init_tema()
 with st.sidebar:
     st.title("📦 Inventory Pro")
     operator = st.text_input("Nama operator", value="Admin")
@@ -411,6 +496,19 @@ with st.sidebar:
     if st.button("🔄 Refresh sekarang"):
         load_data.clear()
         st.rerun()
+    with st.expander("🎨 Tampilan & warna"):
+        st.selectbox("Tema warna", list(PRESET), key="preset", on_change=terapkan_preset)
+        for k, label in LABEL_WARNA.items():
+            st.color_picker(label, key=f"w_{k}")
+        b1, b2 = st.columns(2)
+        if b2.button("↩️ Reset", on_click=reset_tema):
+            pass
+        if b1.button("💾 Simpan"):
+            try:
+                simpan_tema()
+                st.success("Tersimpan sebagai default.")
+            except Exception as e:
+                st.error(f"Gagal menyimpan: {type(e).__name__}")
 
 if not get_spreadsheet() and not os.path.exists("data/produk.csv"):
     diagnosa_secrets()
