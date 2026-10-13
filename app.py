@@ -62,7 +62,7 @@ def load_data():
         p = pd.DataFrame(sh.worksheet("Produk").get_all_records())
         t = pd.DataFrame(sh.worksheet("Transaksi").get_all_records())
     else:
-        p, t = pd.read_csv("produk.csv"), pd.read_csv("transaksi.csv")
+        p, t = pd.read_csv("data/produk.csv"), pd.read_csv("data/transaksi.csv")
     p, t = p.reindex(columns=KOLOM_P), t.reindex(columns=KOLOM_T)
     for c in ["Harga_Beli", "Harga_Jual", "Stok_Min", "Stok_Awal"]:
         p[c] = pd.to_numeric(p[c], errors="coerce").fillna(0)
@@ -91,7 +91,7 @@ def tambah_transaksi(sku, tipe, qty, operator, catatan):
     if sh:
         sh.worksheet("Transaksi").append_row(row, value_input_option="USER_ENTERED")
     else:
-        pd.DataFrame([row], columns=KOLOM_T).to_csv("transaksi.csv", mode="a", header=False, index=False)
+        pd.DataFrame([row], columns=KOLOM_T).to_csv("data/transaksi.csv", mode="a", header=False, index=False)
     load_data.clear()
 
 
@@ -101,7 +101,7 @@ def tambah_produk(data: dict):
     if sh:
         sh.worksheet("Produk").append_row(row, value_input_option="USER_ENTERED")
     else:
-        pd.DataFrame([row], columns=KOLOM_P).to_csv("produk.csv", mode="a", header=False, index=False)
+        pd.DataFrame([row], columns=KOLOM_P).to_csv("data/produk.csv", mode="a", header=False, index=False)
     load_data.clear()
 
 
