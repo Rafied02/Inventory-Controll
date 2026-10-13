@@ -760,12 +760,14 @@ admin = user["peran"] == "admin"
 operator = user["nama"]
 with st.sidebar:
     st.title("📦 Inventory Pro")
-    st.markdown(f"👤 **{user['nama']}** · {'Admin' if admin else 'Staf'}")
+    st.markdown(f"👤 **{user['nama']}**")
+    st.caption("Administrator" if admin else "Staf gudang")
     if st.button("🚪 Keluar"):
         keluar()
         st.rerun()
     if get_spreadsheet():
-        st.success("Terhubung ke Google Sheet")
+        if admin:
+            st.caption("🟢 Data tersinkron")
     else:
         st.warning("Mode DEMO (data CSV lokal). Isi secrets untuk menyambung ke Google Sheet.")
     if st.button("🔄 Refresh sekarang"):
