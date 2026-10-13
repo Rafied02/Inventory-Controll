@@ -301,6 +301,16 @@ def ubah_pengguna(username, **perubahan):
     muat_pengguna.clear()
 
 
+def hapus_pengguna(username):
+    if get_spreadsheet():
+        ws = _ws("Pengguna", KOLOM_U)
+        ws.delete_rows(ws.col_values(1).index(username) + 1)
+    else:
+        df = muat_pengguna()
+        df[df["Username"] != username].to_csv("data/pengguna.csv", index=False)
+    muat_pengguna.clear()
+
+
 def catat_audit(aksi, objek="", detail=None):
     """Catat aktivitas. Kegagalan mencatat tidak boleh mengganggu pengguna."""
     try:
@@ -630,6 +640,9 @@ def tab_laporan():
 # ---------- tab: pengguna (admin) ----------
 def tab_pengguna():
     me = st.session_state["user"]["username"]
+    pesan = st.session_state.pop("pesan_pengguna", None)
+    if pesan:
+        st.success(pesan)
     pengguna = muat_pengguna()
     c1, c2 = st.columns(2)
 
@@ -658,6 +671,7 @@ def tab_pengguna():
             aktif_lama = row["Aktif"].upper() != "N"
             with st.form("ubah_user"):
                 peran_baru = st.selectbox("Peran", ["staf", "admin"], index=1 if row["Peran"] == "admin" else 0, key=f"peran_{pilih}")
+                nama_baru = st.text_input("Nama lengkap", value=row["Nama"], key=f"nama_{pilih}").strip()
                 aktif_baru = st.checkbox("Akun aktif", value=aktif_lama, key=f"aktif_{pilih}")
                 pw_baru = st.text_input("Password baru (kosongkan jika tidak diganti)", type="password", key=f"pw_{pilih}")
                 ok2 = st.form_submit_button("Simpan perubahan")
@@ -673,6 +687,10 @@ def tab_pengguna():
                 if err:
                     st.error(err)
                 else:
+                    if nama_baru and nama_baru != row["Nama"]:
+                        ubah["Nama"], log["nama"] = nama_baru, [row["Nama"], nama_baru]
+                        if pilih == me:
+                            st.session_state["user"]["nama"] = nama_baru
                     if peran_baru != row["Peran"]:
                         ubah["Peran"], log["peran"] = peran_baru, [row["Peran"], peran_baru]
                     if aktif_baru != aktif_lama:
@@ -685,6 +703,24 @@ def tab_pengguna():
                         ubah_pengguna(pilih, **ubah)
                         catat_audit("PENGGUNA_UBAH", pilih, log)
                         st.success("Perubahan disimpan.")
+
+            with st.expander("🗑️ Hapus pengguna"):
+                st.caption("Penghapusan permanen. Riwayat transaksi dan log audit tetap tersimpan (nama operator tercatat sebagai teks). "
+                           "Jika hanya ingin mencabut akses, cukup nonaktifkan akun.")
+                konfirmasi = st.text_input(f"Ketik `{pilih}` untuk konfirmasi", key=f"hapus_{pilih}")
+                if st.button("Hapus permanen", key=f"btn_hapus_{pilih}"):
+                    admin_lain = pengguna[(pengguna["Peran"] == "admin") & (pengguna["Aktif"].str.upper() != "N") & (pengguna["Username"] != pilih)]
+                    if pilih == me:
+                        st.error("Anda tidak bisa menghapus akun sendiri.")
+                    elif konfirmasi.strip() != pilih:
+                        st.error("Konfirmasi tidak cocok dengan username.")
+                    elif row["Peran"] == "admin" and aktif_lama and len(admin_lain) == 0:
+                        st.error("Harus tersisa minimal satu admin aktif.")
+                    else:
+                        hapus_pengguna(pilih)
+                        catat_audit("PENGGUNA_HAPUS", pilih, dict(nama=row["Nama"], peran=row["Peran"]))
+                        st.session_state["pesan_pengguna"] = f"Pengguna {pilih} dihapus."
+                        st.rerun()
 
     st.subheader("Daftar pengguna")
     st.dataframe(muat_pengguna()[["Username", "Nama", "Peran", "Aktif"]], hide_index=True, use_container_width=True)
